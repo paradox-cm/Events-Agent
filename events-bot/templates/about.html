@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+
+{% block title %}About - Reno Family Events{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-8 mx-auto">
+        <div class="card">
+            <div class="card-header bg-primary text-white">
+                <h1 class="h3 mb-0">
+                    <i class="fas fa-info-circle me-2"></i>
+                    About Reno Family Events
+                </h1>
+            </div>
+            <div class="card-body">
+                <p class="lead">
+                    The Reno Family Events web app displays family and teen-friendly events 
+                    collected from 20+ local sources in the Reno, Sparks, Carson City, and Lake Tahoe areas.
+                </p>
+
+                <h3 class="h5 mt-4">
+                    <i class="fas fa-robot me-2 text-primary"></i>
+                    How It Works
+                </h3>
+                <p>
+                    Our automated agent scans local event sources daily, filters for family-friendly content, 
+                    and presents the events in an easy-to-browse format. Events are grouped by date and 
+                    include all the details you need to plan your family activities.
+                </p>
+
+                <h3 class="h5 mt-4">
+                    <i class="fas fa-calendar-check me-2 text-primary"></i>
+                    Event Sources
+                </h3>
+                <div class="row">
+                    <div class="col-md-6">
+                        <h6>Core Sources</h6>
+                        <ul class="list-unstyled">
+                            <li><i class="fas fa-check text-success me-2"></i>Visit Carson City</li>
+                            <li><i class="fas fa-check text-success me-2"></i>PBS Reno Kids Club</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Lake Tahoe Travel</li>
+                        </ul>
+                        
+                        <h6>Reno/Sparks Area</h6>
+                        <ul class="list-unstyled">
+                            <li><i class="fas fa-check text-success me-2"></i>This Is Reno</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Reno News & Review</li>
+                            <li><i class="fas fa-check text-success me-2"></i>City of Reno</li>
+                            <li><i class="fas fa-check text-success me-2"></i>City of Sparks</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Washoe County Library</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Nevada Moms</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Macaroni KID</li>
+                        </ul>
+                    </div>
+                    <div class="col-md-6">
+                        <h6>Museums & Venues</h6>
+                        <ul class="list-unstyled">
+                            <li><i class="fas fa-check text-success me-2"></i>The Discovery</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Nevada Museum of Art</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Reno Public Market</li>
+                            <li><i class="fas fa-check text-success me-2"></i>KUNR Community Calendar</li>
+                        </ul>
+                        
+                        <h6>Lake Tahoe</h6>
+                        <ul class="list-unstyled">
+                            <li><i class="fas fa-check text-success me-2"></i>Visit Reno Tahoe</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Tahoe.com</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Visit Lake Tahoe</li>
+                        </ul>
+                        
+                        <h6>Aggregators</h6>
+                        <ul class="list-unstyled">
+                            <li><i class="fas fa-check text-success me-2"></i>Eventbrite</li>
+                            <li><i class="fas fa-check text-success me-2"></i>Facebook Events</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <h3 class="h5 mt-4">
+                    <i class="fas fa-filter me-2 text-primary"></i>
+                    Family-Friendly Filtering
+                </h3>
+                <p>
+                    Events are automatically filtered to exclude adult-only venues and activities. 
+                    We focus on events that are suitable for families with children and teenagers.
+                </p>
+
+                <h3 class="h5 mt-4">
+                    <i class="fas fa-sync-alt me-2 text-primary"></i>
+                    Real-Time Updates
+                </h3>
+                <p>
+                    Click the "Refresh" button to collect the latest events from all sources. 
+                    The agent respects website terms of service and uses polite delays between requests.
+                </p>
+
+                <h3 class="h5 mt-4">
+                    <i class="fas fa-envelope me-2 text-primary"></i>
+                    Email Digest
+                </h3>
+                <p>
+                    The agent can also send daily email digests with new events. 
+                    Configure your email settings in the agent's configuration file.
+                </p>
+
+                <div class="alert alert-info mt-4">
+                    <i class="fas fa-lightbulb me-2"></i>
+                    <strong>Tip:</strong> Use the timeframe filters (Today, This Week, Next Week, All Events) 
+                    to focus on events that fit your schedule.
+                </div>
+
+                <div class="text-center mt-4">
+                    <a href="{{ url_for('index') }}" class="btn btn-primary">
+                        <i class="fas fa-calendar-alt me-2"></i>
+                        View Events
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

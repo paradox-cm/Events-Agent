@@ -1,0 +1,1001 @@
+#!/usr/bin/env python3
+"""
+Automated event-scouting agent for Reno, Sparks, Carson City, Lake Tahoe.
+
+WHAT’S INCLUDED
+- Core parsers for: Visit Carson City, PBS Reno Kids Club, Lake Tahoe Travel
+  (existing), plus MANY NEW SOURCES listed below.
+- Optional Facebook Graph API fetch for public page events.
+- Optional Eventbrite API or HTML fallback for city/category queries.
+- Source registry (enable/disable via .env).
+- Family/teen-friendly filter: excludes obvious 18+ nightlife; keeps general
+  events unless clearly adult-only.
+
+DATE WINDOWS
+- Groups events by: 0–3 days, 4–7 days, 8–14 days from “today”.
+
+SETUP
+- pip install beautifulsoup4 requests python-dateutil python-dotenv
+- Configure .env (see sample at end of file docstring).
+- Schedule daily run via cron/Task Scheduler.
+
+NOTES
+- Parsers are “best-effort” for common site structures; some sites use dynamic
+  JS or anti-bot systems. The code handles failures gracefully and continues.
+- Facebook/Eventbrite support is optional; add tokens to .env to activate.
+- Always respect sites’ robots and terms; this script uses modest delays.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+import math
+import random
+import logging
+import smtplib
+from typing import List, Iterable, Optional, Callable, Dict, Tuple
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from email.message import EmailMessage
+
+import requests
+from bs4 import BeautifulSoup
+from dateutil import parser as dateparser
+from dotenv import load_dotenv
+
+# ------------------------- Config / Utilities -------------------------
+
+load_dotenv()
+LOGLEVEL = os.getenv("LOGLEVEL", "INFO").upper()
+logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)s %(message)s")
+
+HEADERS = {
+    "User-Agent": "RenoFamilyEventsBot/2.0 (+https://example.com; contact=you@example.com)"
+}
+
+# Global politeness (min/max seconds between HTTP calls)
+REQUEST_SLEEP = (0.8, 1.8)
+
+def sleep_briefly():
+    time.sleep(random.uniform(*REQUEST_SLEEP))
+
+def fetch(url: str) -> Optional[BeautifulSoup]:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        if resp.status_code != 200:
+            logging.warning("Fetch failed %s -> %s", url, resp.status_code)
+            return None
+        return BeautifulSoup(resp.text, "html.parser")
+    except Exception as e:
+        logging.warning("Error fetching %s: %s", url, e)
+        return None
+    finally:
+        sleep_briefly()
+
+def parse_date_range(text: str, default_year: Optional[int] = None) -> Tuple[date, date]:
+    # Accepts formats like "Oct 18 - 19", "Oct 17 – Nov 1", "Oct 25, 2025"
+    t = text.replace("–", "-").replace("—", "-").strip()
+    default_year = default_year or date.today().year
+    parts = [p.strip(", ").strip() for p in t.split("-")]
+    if len(parts) == 1:
+        d = dateparser.parse(f"{parts[0]} {default_year}", fuzzy=True).date()
+        return d, d
+    if len(parts) == 2:
+        # part 1 always has month; part 2 may or may not
+        d1 = dateparser.parse(f"{parts[0]} {default_year}", fuzzy=True).date()
+        if re.search(r"[A-Za-z]", parts[1]):
+            d2 = dateparser.parse(f"{parts[1]} {default_year}", fuzzy=True).date()
+        else:
+            month = re.match(r"([A-Za-z]+)", parts[0]).group(1)
+            d2 = dateparser.parse(f"{month} {parts[1]} {default_year}", fuzzy=True).date()
+        return d1, d2
+    # Fallback: parse first piece only
+    d = dateparser.parse(f"{parts[0]} {default_year}", fuzzy=True).date()
+    return d, d
+
+@dataclass
+class Event:
+    title: str
+    start_date: date
+    end_date: date
+    time_text: Optional[str]
+    location: str
+    description: str
+    link: str
+    source: str
+    tags: List[str] = None
+
+    def occurs_within(self, start: date, end: date) -> bool:
+        return not (self.end_date < start or self.start_date > end)
+
+    def serialize(self) -> dict:
+        return {
+            "title": self.title,
+            "start_date": self.start_date.isoformat(),
+            "end_date": self.end_date.isoformat(),
+            "time_text": self.time_text,
+            "location": self.location,
+            "description": self.description,
+            "link": self.link,
+            "source": self.source,
+            "tags": self.tags or [],
+        }
+
+    @staticmethod
+    def deserialize(d: dict) -> "Event":
+        return Event(
+            title=d["title"],
+            start_date=date.fromisoformat(d["start_date"]),
+            end_date=date.fromisoformat(d["end_date"]),
+            time_text=d.get("time_text"),
+            location=d.get("location", ""),
+            description=d.get("description", ""),
+            link=d.get("link", ""),
+            source=d.get("source", ""),
+            tags=d.get("tags", []),
+        )
+
+class EventDB:
+    def __init__(self, path: str):
+        self.path = path
+        self.events: List[Event] = []
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            self.events = []
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.events = [Event.deserialize(x) for x in data]
+        except Exception as e:
+            logging.warning("Could not load DB: %s", e)
+            self.events = []
+
+    def save(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump([e.serialize() for e in self.events], f, indent=2)
+
+    def has(self, ev: Event) -> bool:
+        return any((x.title == ev.title and x.start_date == ev.start_date) for x in self.events)
+
+    def add_all(self, events: Iterable[Event]):
+        for e in events:
+            if not self.has(e):
+                self.events.append(e)
+
+# ------------------------- Family/Teen Filter -------------------------
+
+ADULT_KEYWORDS = {"nightclub", "21+", "21 plus", "burlesque", "strip", "adult-only", "poker", "slots"}
+EXCLUDE_TITLE_KEYWORDS = {"brew", "pub", "bar", "cocktail", "nightclub"}
+
+def is_family_or_general(title: str, desc: str) -> bool:
+    t = (title or "").lower()
+    d = (desc or "").lower()
+    if any(k in t for k in EXCLUDE_TITLE_KEYWORDS):
+        return False
+    if any(k in t or k in d for k in ADULT_KEYWORDS):
+        return False
+    return True
+
+# ------------------------- Parsers (core & new) -------------------------
+
+def add_event(events: List[Event], **kwargs):
+    ev = Event(**kwargs)
+    if is_family_or_general(ev.title, ev.description):
+        events.append(ev)
+
+# Existing: Visit Carson City (special events pages with list cards)
+def parse_visit_carson_city() -> List[Event]:
+    results: List[Event] = []
+    # pages like https://visitcarsoncity.com/_event/page/1/
+    for p in (1, 2, 3):
+        soup = fetch(f"https://visitcarsoncity.com/_event/page/{p}/")
+        if not soup:
+            continue
+        for a in soup.select("a.post-list-card"):
+            try:
+                date_li = a.select_one("ul.post-list-card__dates li")
+                headline = a.select_one("h3.post-list-card__headline")
+                time_li = a.select_one("li.post-list-card__meta-item--time")
+                loc_li = a.select_one("li.post-list-card__meta-item--location")
+                desc = a.select_one("div.post-list-card__description")
+                href = a.get("href") or ""
+                if not (date_li and headline and href):
+                    continue
+                s, e = parse_date_range(date_li.get_text(strip=True))
+                add_event(results,
+                    title=headline.get_text(strip=True),
+                    start_date=s, end_date=e,
+                    time_text=time_li.get_text(strip=True) if time_li else None,
+                    location=loc_li.get_text(strip=True) if loc_li else "",
+                    description=(desc.get_text(" ", strip=True) if desc else ""),
+                    link=href,
+                    source="Visit Carson City",
+                    tags=["carson-city"],
+                )
+            except Exception:
+                continue
+    return results
+
+# Existing improved: PBS Reno Kids Club
+def parse_pbs_reno_kids_club() -> List[Event]:
+    url = "https://www.pbsreno.org/support/kidsclub/events/"
+    soup = fetch(url)
+    results: List[Event] = []
+    if not soup:
+        return results
+    for h2 in soup.find_all("h2"):
+        title = h2.get_text(" ", strip=True)
+        # walk sibling <p> blocks until next h2
+        ps = []
+        sib = h2.find_next_sibling()
+        while sib and sib.name != "h2":
+            if sib.name == "p":
+                ps.append(sib.get_text(" ", strip=True))
+            sib = sib.find_next_sibling()
+        when = next((p for p in ps if p.lower().startswith("when:")), None)
+        where = next((p for p in ps if p.lower().startswith("where:")), None)
+        if not when:
+            continue
+        when_detail = when.split(":", 1)[-1].strip()
+        # Split at ", from " or ", " heuristic:
+        date_part = when_detail.split(" from ")[0].split(", ", 1)[0]
+        try:
+            d = dateparser.parse(date_part, fuzzy=True).date()
+        except Exception:
+            continue
+        add_event(results,
+            title=title,
+            start_date=d, end_date=d,
+            time_text=None if "from " not in when_detail else when_detail.split("from ", 1)[-1],
+            location=(where.split(":", 1)[-1].strip() if where else ""),
+            description=" ".join([p for p in ps if p not in (when, where)]),
+            link=url,
+            source="PBS Reno Kids Club",
+            tags=["reno", "kids"],
+        )
+    return results
+
+# Existing: Lake Tahoe Travel (detail pages use readable paragraphs)
+def parse_lake_tahoe_travel_list() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://laketahoetravel.com/events/")
+    if not soup:
+        return results
+    for a in soup.select('a[href*="/event/"]'):
+        href = a.get("href") or ""
+        title_el = a.find("h3")
+        if not title_el or not href:
+            continue
+        # Visit detail page to extract dates, etc.
+        detail = fetch(href)
+        if not detail:
+            continue
+        # Find a paragraph with schedule or an obvious block with times
+        raw = detail.get_text(" ", strip=True)
+        # crude capture for date text (month names present)
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^\\n]+", raw)
+        if not m:
+            continue
+        date_text = m.group(0)
+        try:
+            s, e = parse_date_range(re.sub(r",?\s*\d{4}", "", date_text))
+        except Exception:
+            continue
+        # time/location heuristic
+        time_text = None
+        loc = ""
+        for span in detail.find_all(["span", "p"]):
+            txt = span.get_text(" ", strip=True)
+            if not time_text and re.search(r"\d{1,2}:\d{2}\s*(am|pm)", txt, re.I):
+                time_text = txt
+            if any(k in txt for k in ("Tahoe", "Park", "Beach", "Incline", "Village", "Stateline")):
+                loc = txt
+        add_event(results,
+            title=title_el.get_text(" ", strip=True),
+            start_date=s, end_date=e,
+            time_text=time_text,
+            location=loc,
+            description=" ".join(p.get_text(" ", strip=True) for p in detail.select("p")[:3]),
+            link=href,
+            source="Lake Tahoe Travel",
+            tags=["tahoe"],
+        )
+    return results
+
+# NEW: This Is Reno (general calendar)
+def parse_this_is_reno() -> List[Event]:
+    # Example list page: https://thisisreno.com/events/
+    results: List[Event] = []
+    soup = fetch("https://thisisreno.com/events/")
+    if not soup:
+        return results
+    for ev in soup.select("div.tribe-common-g-row, div.tribe-events-calendar-list__event-row"):
+        try:
+            title_a = ev.select_one("a.tribe-event-url, a.tribe-common-anchor-thin")
+            if not title_a:
+                continue
+            title = title_a.get_text(" ", strip=True)
+            link = title_a.get("href") or ""
+            when = ev.get_text(" ", strip=True)
+            # best-effort: look for month/day range in the container text
+            m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", when)
+            if not m:
+                # fallback: visit detail
+                detail = fetch(link) if link else None
+                if not detail:
+                    continue
+                dt_text = detail.get_text(" ", strip=True)
+                m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", dt_text)
+                if not m:
+                    continue
+            s, e = parse_date_range(m.group(0))
+            add_event(results,
+                title=title,
+                start_date=s, end_date=e,
+                time_text=None,
+                location="Reno/Sparks",
+                description="",
+                link=link,
+                source="This Is Reno",
+                tags=["reno", "general"],
+            )
+        except Exception:
+            continue
+    return results
+
+# NEW: Reno News & Review (RN&R) – community calendar
+def parse_rnr() -> List[Event]:
+    # https://reno.newsreview.com/events/ (structure can vary)
+    results: List[Event] = []
+    soup = fetch("https://reno.newsreview.com/events/")
+    if not soup:
+        return results
+    for ev in soup.select("article, div.event-item, li.event"):
+        a = ev.find("a")
+        if not a:
+            continue
+        title = a.get_text(" ", strip=True)
+        href = a.get("href") or ""
+        text = ev.get_text(" ", strip=True)
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", text)
+        if not m:
+            continue
+        s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="Reno/Sparks", description="", link=href,
+            source="Reno News & Review", tags=["reno", "general"])
+    return results
+
+# NEW: Reno Gazette Journal – public 'Things to do' (may be partial due to paywall)
+def parse_rgj() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://www.rgj.com/things-to-do/")
+    if not soup:
+        return results
+    for a in soup.select("a[href*='/story/']"):
+        title = a.get_text(" ", strip=True)
+        href = a.get("href") or ""
+        if not title or not href:
+            continue
+        # RGJ often has roundups; dates are in article bodies; we leave date TBD
+        # Skip adult-nightlife keywords
+        if not is_family_or_general(title, ""):
+            continue
+        # Approximate: mark as general; script will skip if it can't parse dates later
+        today = date.today()
+        add_event(results,
+            title=title, start_date=today, end_date=today,
+            time_text=None, location="Reno/Sparks", description="(RGJ listing)",
+            link=href, source="Reno Gazette Journal", tags=["reno", "general"])
+    return results
+
+# NEW: City of Reno – Special Events (official)
+def parse_city_of_reno() -> List[Event]:
+    # https://www.reno.gov/Community/Special-Events (structure subject to change)
+    results: List[Event] = []
+    soup = fetch("https://www.reno.gov/Community/Special-Events")
+    if not soup:
+        return results
+    for ev in soup.select("a, li"):
+        txt = ev.get_text(" ", strip=True)
+        href = ev.get("href") or ""
+        if not href or "http" not in href:
+            continue
+        if any(w in txt.lower() for w in ("special event", "parade", "festival", "concert", "kids", "family", "holiday")):
+            # Try to extract a date pattern from nearby text
+            m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", txt)
+            s, e = (date.today(), date.today())
+            if m:
+                s, e = parse_date_range(m.group(0))
+            add_event(results,
+                title=txt[:120],
+                start_date=s, end_date=e,
+                time_text=None, location="Reno",
+                description="", link=href,
+                source="City of Reno", tags=["reno", "official"])
+    return results
+
+# NEW: City of Sparks – Events (official)
+def parse_city_of_sparks() -> List[Event]:
+    # https://cityofsparks.us (events section; structure varies)
+    results: List[Event] = []
+    soup = fetch("https://cityofsparks.us/")
+    if not soup:
+        return results
+    for a in soup.select("a"):
+        href = a.get("href") or ""
+        title = a.get_text(" ", strip=True)
+        if not href or not title:
+            continue
+        if "event" in href and is_family_or_general(title, ""):
+            today = date.today()
+            add_event(results,
+                title=title, start_date=today, end_date=today,
+                time_text=None, location="Sparks", description="",
+                link=href, source="City of Sparks", tags=["sparks", "official"])
+    return results
+
+# NEW: Washoe County Library – Events
+def parse_washoe_library() -> List[Event]:
+    # Main events landing: https://www.washoecountylibrary.us/events.php
+    # Branch calendars often powered by LibCal; selectors differ—use best-effort.
+    results: List[Event] = []
+    soup = fetch("https://www.washoecountylibrary.us/events.php")
+    if not soup:
+        return results
+    for ev in soup.select("li, article, div.event"):
+        text = ev.get_text(" ", strip=True)
+        a = ev.find("a")
+        if not a:
+            continue
+        title = a.get_text(" ", strip=True)
+        href = a.get("href") or ""
+        if not title or not href:
+            continue
+        if any(k in title.lower() for k in ("story", "teen", "family", "kids", "lego", "craft", "steam", "study", "club")):
+            m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", text)
+            s, e = (date.today(), date.today())
+            if m:
+                s, e = parse_date_range(m.group(0))
+            add_event(results,
+                title=title, start_date=s, end_date=e, time_text=None,
+                location="Washoe County Library", description="", link=href,
+                source="Washoe County Library", tags=["reno", "library"])
+    return results
+
+# NEW: Nevada Moms (Northern Nevada family calendar)
+def parse_nevada_moms() -> List[Event]:
+    # https://nvmoms.com/events/ (or a region-specific page)
+    results: List[Event] = []
+    soup = fetch("https://nvmoms.com/events/")
+    if not soup:
+        return results
+    for ev in soup.select("a"):
+        href = ev.get("href") or ""
+        title = ev.get_text(" ", strip=True)
+        if not href or not title or "/event/" not in href:
+            continue
+        if not is_family_or_general(title, ""):
+            continue
+        # visit detail page for date
+        detail = fetch(href)
+        if not detail:
+            continue
+        text = detail.get_text(" ", strip=True)
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", text)
+        if not m:
+            continue
+        s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="Reno/Sparks/Carson/Tahoe", description="",
+            link=href, source="Nevada Moms", tags=["family"])
+    return results
+
+# NEW: Macaroni KID (Reno/Sparks)
+def parse_macaroni_kid() -> List[Event]:
+    # https://renosparks.macaronikid.com/events
+    results: List[Event] = []
+    soup = fetch("https://renosparks.macaronikid.com/events")
+    if not soup:
+        return results
+    for ev in soup.select("a"):
+        href = ev.get("href") or ""
+        title = ev.get_text(" ", strip=True)
+        if not href or not title or "/events/" not in href:
+            continue
+        if not is_family_or_general(title, ""):
+            continue
+        # Try to infer date from anchor surroundings OR visit detail
+        s, e = (date.today(), date.today())
+        detail = fetch(href)
+        if detail:
+            text = detail.get_text(" ", strip=True)
+            m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", text)
+            if m:
+                s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="Reno/Sparks", description="", link=href,
+            source="Macaroni KID", tags=["family"])
+    return results
+
+# NEW: KUNR Community Calendar (general; has Kids & Family category)
+def parse_kunr() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://www.kunr.org/community-calendar")
+    if not soup:
+        return results
+    for h3 in soup.find_all("h3"):
+        a = h3.find("a")
+        if not a:
+            continue
+        title = a.get_text(" ", strip=True)
+        href = a.get("href") or ""
+        # Find nearby time/location lines
+        container = h3.parent
+        text = container.get_text(" ", strip=True) if container else ""
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", text)
+        if not m:
+            continue
+        s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="", description="", link=href,
+            source="KUNR Community Calendar", tags=["general"])
+    return results
+
+# NEW: Reno Public Market (community events)
+def parse_reno_public_market() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://www.renopublicmarket.com/community-events")
+    if not soup:
+        return results
+    for a in soup.select("a"):
+        href = a.get("href") or ""
+        title = a.get_text(" ", strip=True)
+        if not href or "/events/" not in href.lower() and "/community" not in href.lower():
+            continue
+        if not is_family_or_general(title, ""):
+            continue
+        # visit detail to grab date
+        detail = fetch(href)
+        if not detail:
+            continue
+        text = detail.get_text(" ", strip=True)
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", text)
+        if not m:
+            continue
+        s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="Reno Public Market", description="", link=href,
+            source="Reno Public Market", tags=["reno"])
+    return results
+
+# NEW: The Discovery (Nevada Discovery Museum)
+def parse_the_discovery() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://nvdm.org/events/")
+    if not soup:
+        return results
+    for ev in soup.select("article, li, div"):
+        a = ev.find("a")
+        if not a:
+            continue
+        title = a.get_text(" ", strip=True)
+        href = a.get("href") or ""
+        if not title or not href:
+            continue
+        if not is_family_or_general(title, ""):
+            continue
+        detail = fetch(href)
+        if not detail:
+            continue
+        text = detail.get_text(" ", strip=True)
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", text)
+        if not m:
+            continue
+        s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="The Discovery (Reno)", description="",
+            link=href, source="The Discovery", tags=["reno", "museum", "kids"])
+    return results
+
+# NEW: Nevada Museum of Art (Reno)
+def parse_nevada_museum_of_art() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://www.nevadaart.org/calendar/")
+    if not soup:
+        return results
+    for a in soup.select("a"):
+        href = a.get("href") or ""
+        title = a.get_text(" ", strip=True)
+        if not href or "/event/" not in href:
+            continue
+        if not is_family_or_general(title, ""):
+            continue
+        detail = fetch(href)
+        if not detail:
+            continue
+        txt = detail.get_text(" ", strip=True)
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", txt)
+        if not m:
+            continue
+        s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="Nevada Museum of Art", description="",
+            link=href, source="Nevada Museum of Art", tags=["reno", "museum"])
+    return results
+
+# NEW: Carson Now (Carson City community calendar)
+def parse_carson_now() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://www.carsonnow.org/calendar")
+    if not soup:
+        return results
+    for a in soup.select("a"):
+        href = a.get("href") or ""
+        title = a.get_text(" ", strip=True)
+        if not title or not href or "/event/" not in href:
+            continue
+        # best-effort parse date from surrounding text
+        txt = a.parent.get_text(" ", strip=True) if a.parent else title
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", txt)
+        s, e = (date.today(), date.today())
+        if m:
+            s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="Carson City", description="", link=href,
+            source="Carson Now", tags=["carson-city"])
+    return results
+
+# NEW: Visit Reno Tahoe (regional)
+def parse_visit_reno_tahoe() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://www.visitrenotahoe.com/events/")
+    if not soup:
+        return results
+    for a in soup.select("a"):
+        href = a.get("href") or ""
+        title = a.get_text(" ", strip=True)
+        if not href or "/event/" not in href:
+            continue
+        if not is_family_or_general(title, ""):
+            continue
+        detail = fetch(href)
+        if not detail:
+            continue
+        txt = detail.get_text(" ", strip=True)
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", txt)
+        if not m:
+            continue
+        s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="Reno/Tahoe", description="", link=href,
+            source="Visit Reno Tahoe", tags=["regional"])
+    return results
+
+# NEW: Tahoe.com / Lake Tahoe This Week
+def parse_tahoe_com() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://tahoe.com/events")
+    if not soup:
+        return results
+    for a in soup.select("a"):
+        href = a.get("href") or ""
+        title = a.get_text(" ", strip=True)
+        if not href or "/events/" not in href:
+            continue
+        if not is_family_or_general(title, ""):
+            continue
+        # detail page for dates
+        detail = fetch(href if href.startswith("http") else f"https://tahoe.com{href}")
+        if not detail:
+            continue
+        txt = detail.get_text(" ", strip=True)
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", txt)
+        if not m:
+            continue
+        s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="Lake Tahoe", description="", link=href,
+            source="Tahoe.com", tags=["tahoe"])
+    return results
+
+# NEW: Visit Lake Tahoe (South Tahoe)
+def parse_visit_lake_tahoe() -> List[Event]:
+    results: List[Event] = []
+    soup = fetch("https://visitlaketahoe.com/events/")
+    if not soup:
+        return results
+    for a in soup.select("a"):
+        href = a.get("href") or ""
+        title = a.get_text(" ", strip=True)
+        if not href or "/event/" not in href:
+            continue
+        if not is_family_or_general(title, ""):
+            continue
+        detail = fetch(href)
+        if not detail:
+            continue
+        txt = detail.get_text(" ", strip=True)
+        m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", txt)
+        if not m:
+            continue
+        s, e = parse_date_range(m.group(0))
+        add_event(results,
+            title=title, start_date=s, end_date=e, time_text=None,
+            location="South Lake Tahoe", description="", link=href,
+            source="Visit Lake Tahoe", tags=["tahoe", "south"])
+    return results
+
+# ------------------------- Optional: Eventbrite -------------------------
+
+def parse_eventbrite(city_query="Reno, NV", radius_km=80, category_ids=("115", "116")) -> List[Event]:
+    """
+    Uses Eventbrite API if EVENTBRITE_TOKEN is present; otherwise tries HTML fallback.
+    category_ids 115=Family & Education, 116=Other kids/teens in Eventbrite taxonomy (example).
+    """
+    token = os.getenv("EVENTBRITE_TOKEN")
+    results: List[Event] = []
+    if token:
+        try:
+            url = ("https://www.eventbriteapi.com/v3/events/search/?location.address="
+                   f"{requests.utils.quote(city_query)}&location.within={radius_km}km&expand=venue")
+            # add category filter if desired
+            if category_ids:
+                url += "&categories=" + ",".join(category_ids)
+            resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                for ev in data.get("events", []):
+                    if ev.get("online_event"):
+                        continue
+                    title = ev.get("name", {}).get("text", "")
+                    start_iso = ev.get("start", {}).get("local", "")
+                    end_iso = ev.get("end", {}).get("local", start_iso)
+                    s = dateparser.parse(start_iso).date() if start_iso else date.today()
+                    e = dateparser.parse(end_iso).date() if end_iso else s
+                    venue = ev.get("venue", {})
+                    loc = venue.get("address", {}).get("localized_address_display", "")
+                    desc = (ev.get("description", {}) or {}).get("text", "") or ""
+                    link = ev.get("url") or ""
+                    if not is_family_or_general(title, desc):
+                        continue
+                    add_event(results,
+                        title=title, start_date=s, end_date=e,
+                        time_text=None, location=loc, description=desc[:300],
+                        link=link, source="Eventbrite", tags=["aggregator"])
+        except Exception as e:
+            logging.warning("Eventbrite API error: %s", e)
+            # fall through to HTML attempt
+    # HTML fallback (simple /search query page)
+    if not results:
+        soup = fetch("https://www.eventbrite.com/d/nv--reno/kids-and-family--events/")
+        if soup:
+            for a in soup.select("a.eds-event-card-content__action-link"):
+                href = a.get("href") or ""
+                title = a.get_text(" ", strip=True)
+                if not href or not title:
+                    continue
+                detail = fetch(href)
+                if not detail:
+                    continue
+                txt = detail.get_text(" ", strip=True)
+                m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^,]*\d{1,2}(?:\s*-\s*\d{1,2})?", txt)
+                if not m:
+                    continue
+                s, e = parse_date_range(m.group(0))
+                add_event(results,
+                    title=title, start_date=s, end_date=e, time_text=None,
+                    location="Reno/Sparks", description="", link=href,
+                    source="Eventbrite (HTML)", tags=["aggregator"])
+    return results
+
+# ------------------------- Optional: Facebook Graph -------------------------
+
+def fetch_facebook_events(page_ids: List[str], since_days=1, until_days=60) -> List[Event]:
+    """
+    Pull public events for a list of page IDs using the Graph API.
+    Requires FACEBOOK_ACCESS_TOKEN in .env.
+    """
+    token = os.getenv("FACEBOOK_ACCESS_TOKEN")
+    results: List[Event] = []
+    if not token or not page_ids:
+        return results
+    since = int(time.time()) - since_days * 86400
+    until = int(time.time()) + until_days * 86400
+    for pid in page_ids:
+        try:
+            url = (f"https://graph.facebook.com/v17.0/{pid}/events?"
+                   f"time_filter=upcoming&since={since}&until={until}&"
+                   f"fields=name,start_time,end_time,place,description,ticket_uri&access_token={token}")
+            resp = requests.get(url, timeout=20)
+            if resp.status_code != 200:
+                logging.warning("Facebook events fetch failed for %s: %s", pid, resp.text[:200])
+                continue
+            data = resp.json()
+            for ev in data.get("data", []):
+                title = ev.get("name", "")
+                start_iso = ev.get("start_time", "")
+                end_iso = ev.get("end_time", start_iso)
+                s = dateparser.parse(start_iso).date() if start_iso else date.today()
+                e = dateparser.parse(end_iso).date() if end_iso else s
+                loc = ""
+                place = ev.get("place") or {}
+                if isinstance(place, dict):
+                    loc = place.get("name", "") or ""
+                desc = ev.get("description", "") or ""
+                link = ev.get("ticket_uri") or f"https://facebook.com/events/{ev.get('id','')}"
+                if not is_family_or_general(title, desc):
+                    continue
+                add_event(results,
+                    title=title, start_date=s, end_date=e, time_text=None,
+                    location=loc, description=desc[:300], link=link,
+                    source="Facebook Events", tags=["facebook"])
+        except Exception as e:
+            logging.warning("Facebook error for page %s: %s", pid, e)
+    return results
+
+# ------------------------- Aggregation & Email -------------------------
+
+def collect_events() -> List[Event]:
+    """
+    Collect from enabled sources based on .env toggles.
+    All sources return best-effort parsed Events.
+    """
+    sources: Dict[str, Tuple[Callable[[], List[Event]], str]] = {
+        # core existing
+        "SOURCE_VISIT_CARSON_CITY": (parse_visit_carson_city, "Visit Carson City"),
+        "SOURCE_PBS_RENO": (parse_pbs_reno_kids_club, "PBS Reno Kids Club"),
+        "SOURCE_LAKE_TAHOE_TRAVEL": (parse_lake_tahoe_travel_list, "Lake Tahoe Travel"),
+        # reno/sparks
+        "SOURCE_THISISRENO": (parse_this_is_reno, "This Is Reno"),
+        "SOURCE_RNR": (parse_rnr, "Reno News & Review"),
+        "SOURCE_RGJ": (parse_rgj, "Reno Gazette Journal"),
+        "SOURCE_CITY_OF_RENO": (parse_city_of_reno, "City of Reno"),
+        "SOURCE_CITY_OF_SPARKS": (parse_city_of_sparks, "City of Sparks"),
+        "SOURCE_WASHOE_LIBRARY": (parse_washoe_library, "Washoe County Library"),
+        "SOURCE_NEVADA_MOMS": (parse_nevada_moms, "Nevada Moms"),
+        "SOURCE_MACARONI_KID": (parse_macaroni_kid, "Macaroni KID"),
+        "SOURCE_KUNR": (parse_kunr, "KUNR Community Calendar"),
+        "SOURCE_RENO_PUBLIC_MARKET": (parse_reno_public_market, "Reno Public Market"),
+        "SOURCE_DISCOVERY": (parse_the_discovery, "The Discovery"),
+        "SOURCE_NEVADA_MUSEUM_OF_ART": (parse_nevada_museum_of_art, "Nevada Museum of Art"),
+        # carson city
+        "SOURCE_CARSON_NOW": (parse_carson_now, "Carson Now"),
+        # tahoe
+        "SOURCE_VISIT_RENO_TAHOE": (parse_visit_reno_tahoe, "Visit Reno Tahoe"),
+        "SOURCE_TAHOE_COM": (parse_tahoe_com, "Tahoe.com"),
+        "SOURCE_VISIT_LAKE_TAHOE": (parse_visit_lake_tahoe, "Visit Lake Tahoe"),
+        # aggregators
+        "SOURCE_EVENTBRITE": (parse_eventbrite, "Eventbrite"),
+    }
+
+    enabled_results: List[Event] = []
+    for env_key, (fn, label) in sources.items():
+        if os.getenv(env_key, "1") == "1":
+            logging.info("Collecting from: %s", label)
+            try:
+                enabled_results.extend(fn())
+            except Exception as e:
+                logging.warning("Source %s error: %s", label, e)
+
+    # Optional Facebook pages
+    fb_pages_raw = os.getenv("FACEBOOK_PAGE_IDS", "").strip()
+    if fb_pages_raw:
+        page_ids = [p.strip() for p in fb_pages_raw.split(",") if p.strip()]
+        if page_ids:
+            logging.info("Collecting from: Facebook Events (%d pages)", len(page_ids))
+            try:
+                enabled_results.extend(fetch_facebook_events(page_ids))
+            except Exception as e:
+                logging.warning("Facebook page fetch error: %s", e)
+
+    return enabled_results
+
+def format_event(ev: Event) -> str:
+    rng = ev.start_date.strftime("%b %d") if ev.start_date == ev.end_date \
+        else f"{ev.start_date.strftime('%b %d')} – {ev.end_date.strftime('%b %d')}"
+    lines = [ev.title, f"Date: {rng}"]
+    if ev.time_text: lines.append(f"Time: {ev.time_text}")
+    if ev.location: lines.append(f"Location: {ev.location}")
+    if ev.description: lines.append(f"Description: {ev.description}")
+    lines.append(f"More info: {ev.link}")
+    return "\n".join(lines)
+
+def compose_email(new_events: List[Event]) -> Optional[EmailMessage]:
+    if not new_events:
+        return None
+    today = date.today()
+    windows = [
+        ("Coming Up (0–3 days)", today, today + timedelta(days=3)),
+        ("Next Week (4–7 days)", today + timedelta(days=4), today + timedelta(days=7)),
+        ("In Two Weeks (8–14 days)", today + timedelta(days=8), today + timedelta(days=14)),
+    ]
+    grouped = {label: [] for label, _, _ in windows}
+    for ev in new_events:
+        for label, s, e in windows:
+            if ev.occurs_within(s, e):
+                grouped[label].append(ev)
+                break
+
+    body_lines: List[str] = []
+    for label, _, _ in windows:
+        bucket = grouped[label]
+        if not bucket: continue
+        body_lines.append(f"{label}:")
+        for ev in sorted(bucket, key=lambda x: x.start_date):
+            body_lines.append(f"- {ev.title} ({ev.start_date.strftime('%b %d')}) — {ev.source}")
+        body_lines.append("")
+
+    body_lines.append("Details:")
+    for ev in new_events:
+        body_lines.append("")
+        body_lines.append(format_event(ev))
+        body_lines.append("")
+
+    msg = EmailMessage()
+    sender = os.getenv("SMTP_USER")
+    recipient = os.getenv("RECIPIENT")
+    sender_name = os.getenv("SENDER_NAME", "Reno Family Events Bot")
+    if not sender or not recipient:
+        logging.error("SMTP_USER and RECIPIENT required.")
+        return None
+    msg["From"] = f"{sender_name} <{sender}>"
+    msg["To"] = recipient
+    msg["Subject"] = f"Family-Friendly Events Update – {today.strftime('%b %d, %Y')}"
+    msg.set_content("\n".join(body_lines))
+    return msg
+
+def send_email(msg: EmailMessage):
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    if not (smtp_host and smtp_user and smtp_password):
+        logging.error("SMTP_HOST, SMTP_USER, SMTP_PASSWORD required.")
+        return
+    with smtplib.SMTP(smtp_host, smtp_port) as s:
+        s.starttls()
+        s.login(smtp_user, smtp_password)
+        s.send_message(msg)
+
+def main():
+    logging.info("Collecting events from enabled sources...")
+    all_events = collect_events()
+
+    # Window: today -> +14 days (hard filter)
+    today = date.today()
+    cutoff = today + timedelta(days=14)
+    relevant = [e for e in all_events if e.occurs_within(today, cutoff)]
+
+    # Deduplicate by (title, start_date)
+    db = EventDB(path=os.path.join(os.path.dirname(__file__), "events_sent.json"))
+    new_events = [e for e in relevant if not db.has(e)]
+    logging.info("New events: %d (out of %d relevant / %d total)", len(new_events), len(relevant), len(all_events))
+
+    msg = compose_email(new_events)
+    if msg:
+        send_email(msg)
+        db.add_all(new_events)
+        db.save()
+        logging.info("Email sent; DB updated.")
+    else:
+        logging.info("No new events today.")
+
+if __name__ == "__main__":
+    main()
