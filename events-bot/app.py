@@ -123,6 +123,7 @@ def about():
     """About page."""
     return render_template('about.html')
 
+# For Vercel deployment
 if __name__ == '__main__':
     # Create templates directory if it doesn't exist
     templates_dir = os.path.join(os.path.dirname(__file__), 'templates')
@@ -137,3 +138,6 @@ if __name__ == '__main__':
     print("🔄 Press Ctrl+C to stop the server")
     
     app.run(debug=True, host='0.0.0.0', port=3001)
+
+# For Vercel
+app = app

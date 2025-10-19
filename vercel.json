@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "events-bot/app.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "events-bot/app.py"
+    }
+  ],
+  "env": {
+    "PYTHONPATH": "events-bot"
+  }
+}
