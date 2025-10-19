@@ -6,7 +6,8 @@ A simple Flask web interface to display events collected by the agent.
 
 import os
 import json
-from datetime import date, timedelta
+import logging
+from datetime import date, datetime, timedelta
 from flask import Flask, render_template, jsonify, request
 from event_agent import Event, EventDB, collect_events
 
@@ -14,20 +15,32 @@ app = Flask(__name__)
 
 def get_events_data():
     """Get events data from the agent's database and live collection."""
-    # Load existing events from database
-    db_path = os.path.join(os.path.dirname(__file__), "events_sent.json")
-    db = EventDB(db_path)
-    
-    # Also collect fresh events
-    fresh_events = collect_events()
-    
-    # Combine and deduplicate
-    all_events = db.events.copy()
-    for event in fresh_events:
-        if not db.has(event):
-            all_events.append(event)
-    
-    return all_events
+    try:
+        # Load existing events from database
+        db_path = os.path.join(os.path.dirname(__file__), "events_sent.json")
+        db = EventDB(db_path)
+        
+        # For Vercel, limit fresh collection to avoid timeout
+        # Only collect from a few fast sources
+        fresh_events = []
+        try:
+            # Quick collection from a few reliable sources
+            from event_agent import parse_pbs_reno_kids_club, parse_lake_tahoe_travel_list
+            fresh_events.extend(parse_pbs_reno_kids_club())
+            fresh_events.extend(parse_lake_tahoe_travel_list())
+        except Exception as e:
+            logging.warning("Quick collection failed: %s", e)
+        
+        # Combine and deduplicate
+        all_events = db.events.copy()
+        for event in fresh_events:
+            if not db.has(event):
+                all_events.append(event)
+        
+        return all_events
+    except Exception as e:
+        logging.error("Error getting events data: %s", e)
+        return []
 
 def filter_events_by_timeframe(events, timeframe):
     """Filter events by timeframe."""
@@ -122,6 +135,15 @@ def api_refresh():
 def about():
     """About page."""
     return render_template('about.html')
+
+@app.route('/health')
+def health():
+    """Health check endpoint for Vercel."""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0.0'
+    })
 
 # For Vercel deployment
 if __name__ == '__main__':
